@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ЭЛЯ / ELYA AI v2.0 — Telegram admin, VOID moderator and Gemini companion.
-One-file, standard-library-only build for BotHost/Bothost (Python 3.10+).
+ЭЛЯ / ELYA AI v2.1 — TeleBot edition for BotHost.
+One-file Python application using pyTelegramBotAPI (TeleBot) for Telegram events.
+On BotHost select Telegram + TeleBot. All other logic is stdlib-only.
 
 QUICK START
 1) Put main.py and .env in one folder. Fill BOT_TOKEN, OWNER_ID, GEMINI_API_KEY.
@@ -14,7 +15,8 @@ QUICK START
    Post messages (channel), Pin messages (group). Disable privacy via BotFather
    (/setprivacy -> Disable) so it can moderate ordinary group messages.
 
-NO EXTRA PIP PACKAGES. A SQLite file is created at DB_PATH; protect it and .env.
+The hosting template must provide pyTelegramBotAPI (telebot). No other pip packages.
+A SQLite file is created at DB_PATH; protect it and .env.
 Do not publicly distribute the configured .env or the database.
 
 API limitations: Chat growth comes from periodic membership samples, not
@@ -48,7 +50,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-VERSION = "2.0.0"
+VERSION = "2.1.0-telebot"
 LOG = logging.getLogger("elya")
 STOP = threading.Event()
 DB_LOCK = threading.RLock()
@@ -1363,34 +1365,122 @@ class Elya:
         elif chat_type in ("group", "supergroup"):
             self.handle_group(msg, edited="edited_message" in item)
 
+    @staticmethod
+    def _raw_event(value: Any) -> dict:
+        """pyTelegramBotAPI retains original Bot API JSON for message/callback updates."""
+        raw = getattr(value, "json", None)
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except ValueError:
+                pass
+        raise ApiError("Unsupported TeleBot update payload; check pyTelegramBotAPI version")
+
     def run(self) -> None:
+        """Native TeleBot long-polling handlers; admin core remains Telegram Bot API-compatible."""
+        try:
+            import telebot
+        except ImportError as exc:
+            raise SystemExit(
+                "TeleBot не установлен. На BotHost выбери библиотеку TeleBot "
+                "(pyTelegramBotAPI), не aiogram 2."
+            ) from exc
+
+        client = telebot.TeleBot(TOKEN, threaded=False)
         info = self.tg.call("getMe")
         self.bot_id = int(info["id"])
         self.username = str(info.get("username", ""))
-        LOG.info("Started ELYA %s as @%s", VERSION, self.username)
-        self.safe("deleteWebhook", drop_pending_updates=False)
-        last_offset = int(self.db.get("update_offset", "0"))
-        while not STOP.is_set():
+        LOG.info("Started ELYA %s as @%s via TeleBot", VERSION, self.username)
+        # Polling and outgoing requests use the same bot token. An old webhook
+        # would prevent the long polling client from receiving updates.
+        self.tg.call("deleteWebhook", drop_pending_updates=False)
+
+        def deliver_message(message: Any, edited: bool = False, channel: bool = False) -> None:
             try:
-                self.schedule()
-                result = self.tg.call("getUpdates", offset=last_offset, timeout=24, limit=60,
-                                      allowed_updates=["message", "edited_message", "channel_post", "callback_query", "chat_member"])
-                for item in result:
-                    next_offset = int(item["update_id"]) + 1
-                    try:
-                        self.update(item)
-                    except Exception:
-                        LOG.exception("Update processing error (id=%s)", item.get("update_id"))
-                    last_offset = next_offset
-                    self.db.set("update_offset", last_offset)
-            except ApiError as exc:
-                LOG.warning("Polling issue: %s", exc)
-                STOP.wait(max(2, min(30, exc.retry_after or 5)))
+                raw = self._raw_event(message)
+                key = "channel_post" if channel else ("edited_message" if edited else "message")
+                self.update({key: raw})
             except Exception:
-                LOG.exception("Main loop exception")
-                STOP.wait(4)
-        self.pool.shutdown(wait=False, cancel_futures=True)
-        LOG.info("Stopped")
+                LOG.exception("TeleBot message dispatch failed")
+
+        # The list includes non-text formats and service updates; text-only
+        # handlers would leave group service messages invisible to the guard.
+        message_types = [
+            "text", "audio", "document", "photo", "sticker", "video", "video_note",
+            "voice", "animation", "contact", "location", "venue", "dice", "game", "poll",
+            "new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo",
+            "delete_chat_photo", "group_chat_created", "supergroup_chat_created",
+            "channel_chat_created", "migrate_to_chat_id", "migrate_from_chat_id",
+            "pinned_message", "message_auto_delete_timer_changed",
+            "video_chat_started", "video_chat_ended", "video_chat_scheduled",
+            "video_chat_participants_invited", "forum_topic_created", "forum_topic_closed",
+            "forum_topic_reopened", "forum_topic_edited", "general_forum_topic_hidden",
+            "general_forum_topic_unhidden", "write_access_allowed", "connected_website",
+            "successful_payment", "invoice", "passport_data"
+        ]
+
+        @client.message_handler(func=lambda msg: True, content_types=message_types)
+        def on_message(message: Any) -> None:
+            deliver_message(message)
+
+        @client.edited_message_handler(func=lambda msg: True, content_types=message_types)
+        def on_edited(message: Any) -> None:
+            deliver_message(message, edited=True)
+
+        @client.channel_post_handler(func=lambda msg: True, content_types=message_types)
+        def on_channel(message: Any) -> None:
+            deliver_message(message, channel=True)
+
+        @client.callback_query_handler(func=lambda q: True)
+        def on_callback(event: Any) -> None:
+            try:
+                self.callback(self._raw_event(event))
+            except Exception:
+                LOG.exception("TeleBot callback dispatch failed")
+
+        @client.chat_member_handler(func=lambda ev: True)
+        def on_chat_member(event: Any) -> None:
+            try:
+                # TeleBot ChatMemberUpdated is structured, unlike Message.json.
+                self.on_member({
+                    "chat": {"id": event.chat.id},
+                    "old_chat_member": {"status": event.old_chat_member.status},
+                    "new_chat_member": {
+                        "status": event.new_chat_member.status,
+                        "user": {"id": event.new_chat_member.user.id},
+                    },
+                })
+            except Exception:
+                LOG.exception("TeleBot chat_member dispatch failed")
+
+        def scheduler() -> None:
+            while not STOP.is_set():
+                try:
+                    self.schedule()
+                except Exception:
+                    LOG.exception("Scheduled task failed")
+                STOP.wait(20)
+
+        worker = threading.Thread(target=scheduler, daemon=True, name="elya-scheduler")
+        worker.start()
+        try:
+            # This polls from Telegram through the installed TeleBot library.
+            # All declared update types are necessary for moderation and the UI.
+            client.infinity_polling(
+                timeout=20, long_polling_timeout=25, skip_pending=False,
+                allowed_updates=["message", "edited_message", "channel_post",
+                                 "callback_query", "chat_member"]
+            )
+        finally:
+            STOP.set()
+            client.stop_polling()
+            worker.join(timeout=3)
+            self.pool.shutdown(wait=False, cancel_futures=True)
+            LOG.info("Stopped ELYA TeleBot")
 
 
 def main() -> None:
